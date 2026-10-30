@@ -460,8 +460,13 @@ mod watch_tests {
         }
     }
 
+    fn write_info_plist(path: &Path, info: &Dictionary) {
+        let file = std::fs::File::create(path).unwrap();
+        plist::to_writer_binary(file, info).unwrap();
+    }
+
     #[test]
-    fn detects_modern_watch_application_in_plugins() {
+    fn detects_modern_watch_application_marker_and_device_family() {
         let mut watch = test_bundle("com.example.app.watchkitapp", "Watch");
         watch.app_info.insert("WKApplication".to_string(), Value::Boolean(true));
         watch.app_info.insert(
@@ -472,6 +477,77 @@ mod watch_tests {
 
         let extension = test_bundle("com.example.app.extension", "Extension");
         assert!(!extension.is_watch_application());
+    }
+
+    #[test]
+    fn discovers_xcode26_watch_companion_inside_plugins() {
+        let root = std::env::temp_dir().join(format!(
+            "isideload-watch-package-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let host = root.join("NOVACompanion.app");
+        let watch = host.join("PlugIns").join("NOVAWatch.app");
+        let extension = host.join("PlugIns").join("ShareExtension.appex");
+
+        std::fs::create_dir_all(&watch).unwrap();
+        std::fs::create_dir_all(&extension).unwrap();
+
+        let mut host_info = Dictionary::new();
+        host_info.insert(
+            "CFBundleIdentifier".to_string(),
+            Value::String("com.example.app".to_string()),
+        );
+        host_info.insert(
+            "CFBundleName".to_string(),
+            Value::String("NOVA Companion".to_string()),
+        );
+        write_info_plist(&host.join("Info.plist"), &host_info);
+
+        let mut watch_info = Dictionary::new();
+        watch_info.insert(
+            "CFBundleIdentifier".to_string(),
+            Value::String("com.example.app.watchkitapp".to_string()),
+        );
+        watch_info.insert(
+            "CFBundleName".to_string(),
+            Value::String("NOVA Watch".to_string()),
+        );
+        watch_info.insert("WKApplication".to_string(), Value::Boolean(true));
+        watch_info.insert(
+            "WKCompanionAppBundleIdentifier".to_string(),
+            Value::String("com.example.app".to_string()),
+        );
+        watch_info.insert(
+            "UIDeviceFamily".to_string(),
+            Value::Array(vec![Value::Integer(4.into())]),
+        );
+        write_info_plist(&watch.join("Info.plist"), &watch_info);
+
+        let mut extension_info = Dictionary::new();
+        extension_info.insert(
+            "CFBundleIdentifier".to_string(),
+            Value::String("com.example.app.share".to_string()),
+        );
+        extension_info.insert(
+            "CFBundleName".to_string(),
+            Value::String("Share Extension".to_string()),
+        );
+        write_info_plist(&extension.join("Info.plist"), &extension_info);
+
+        let bundle = Bundle::new(host).unwrap();
+
+        assert_eq!(bundle.watch_apps().len(), 1);
+        assert_eq!(
+            bundle.watch_apps()[0].bundle_identifier(),
+            Some("com.example.app.watchkitapp")
+        );
+        assert_eq!(bundle.app_extensions().len(), 1);
+        assert_eq!(
+            bundle.app_extensions()[0].bundle_identifier(),
+            Some("com.example.app.share")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
