@@ -1,8 +1,9 @@
 use crate::{
     dev::{
         app_groups::AppGroupsApi,
-        app_ids::AppIdsApi,
+        app_ids::{AppIdsApi, Profile},
         developer_session::DeveloperSession,
+        device_type::DeveloperDeviceType,
         devices::DevicesApi,
         teams::{DeveloperTeam, TeamsApi},
     },
@@ -10,6 +11,7 @@ use crate::{
         TeamSelection,
         application::{Application, SpecialApp},
         builder::MaxCertsBehavior,
+        bundle::Bundle,
         cert_identity::CertificateIdentity,
         sign,
     },
@@ -18,7 +20,13 @@ use crate::{
 
 use std::path::PathBuf;
 
-use idevice::provider::IdeviceProvider;
+use apple_codesign::ProvisioningProfile;
+use idevice::{
+    IdeviceService,
+    provider::IdeviceProvider,
+    services::companion_proxy::CompanionProxy,
+};
+use plist::Dictionary;
 use rootcause::{option_ext::OptionExt, prelude::*};
 use tracing::info;
 
@@ -100,6 +108,22 @@ impl Sideloader {
         let main_app_name = app.main_app_name()?;
         let main_app_id_str = format!("{}.{}", main_bundle_id, team.team_id);
         app.update_bundle_id(&main_bundle_id, &main_app_id_str)?;
+        let watch_bundle_ids = app.watch_bundle_ids();
+
+        // Unsigned CI-built apps do not carry a signed entitlements blob. HealthKit's
+        // required Info.plist privacy keys do survive packaging, so use those keys to
+        // identify every app-ID-bearing bundle that needs the HealthKit App ID service.
+        let healthkit_bundle_ids = app
+            .bundle
+            .collect_app_id_bundles()
+            .into_iter()
+            .filter(|bundle| {
+                bundle.app_info.contains_key("NSHealthShareUsageDescription")
+                    || bundle.app_info.contains_key("NSHealthUpdateUsageDescription")
+            })
+            .filter_map(|bundle| bundle.bundle_identifier().map(str::to_string))
+            .collect::<std::collections::HashSet<_>>();
+
         let mut app_ids = app
             .register_app_ids(
                 /*&self.extensions_behavior, */ &mut self.dev_session,
@@ -135,6 +159,28 @@ impl Sideloader {
             .await?;
 
         for app_id in app_ids.iter_mut() {
+            if healthkit_bundle_ids.contains(&app_id.identifier) {
+                let device_type = if watch_bundle_ids.contains(&app_id.identifier) {
+                    Some(DeveloperDeviceType::Watchos)
+                } else {
+                    Some(DeveloperDeviceType::Ios)
+                };
+
+                app_id
+                    .ensure_healthkit_feature(&mut self.dev_session, &team, device_type)
+                    .await
+                    .context(format!(
+                        "Failed to configure HealthKit capability for {}",
+                        app_id.identifier
+                    ))?;
+            }
+
+            // The synthetic sideloading app group is an iOS-side concern.
+            // Do not configure a watchOS App ID through the default iOS endpoint.
+            if watch_bundle_ids.contains(&app_id.identifier) {
+                continue;
+            }
+
             app_id
                 .ensure_group_feature(&mut self.dev_session, &team)
                 .await?;
@@ -160,10 +206,39 @@ impl Sideloader {
             .await
             .context("Failed to modify app bundle")?;
 
-        let provisioning_profile = self
+        let main_provisioning_profile = self
             .dev_session
             .download_team_provisioning_profile(&team, &main_app_id, None)
             .await?;
+
+        let mut provisioning_profiles: Vec<(String, Profile, Dictionary)> = Vec::new();
+
+        for id in app_ids
+            .into_iter()
+            .filter(|id| id.identifier != main_app_id.identifier)
+        {
+            let bundle_id = id.identifier.clone();
+
+            let profile_device_type = if watch_bundle_ids.contains(&bundle_id) {
+                Some(DeveloperDeviceType::Watchos)
+            } else {
+                None
+            };
+
+            let profile = self
+                .dev_session
+                .download_team_provisioning_profile(&team, &id, profile_device_type)
+                .await
+                .context(format!(
+                    "Failed to download provisioning profile for {}",
+                    bundle_id
+                ))?;
+
+            let parsed_profile = ProvisioningProfile::parse(profile.encoded_profile.as_ref())?;
+            let entitlements = parsed_profile.entitlements().clone();
+
+            provisioning_profiles.push((bundle_id, profile, entitlements));
+        }
 
         if let Some(callback) = &progress_callback {
             callback(0.2).await;
@@ -171,18 +246,9 @@ impl Sideloader {
 
         info!("Acquired provisioning profile");
 
-        app.bundle.write_info()?;
-        for ext in app.bundle.app_extensions_mut() {
-            ext.write_info()?;
-        }
-        for ext in app.bundle.frameworks_mut() {
-            ext.write_info()?;
-        }
-
-        isideload_vfs::fs::write(
-            app.bundle.bundle_dir.join("embedded.mobileprovision"),
-            provisioning_profile.encoded_profile.as_ref(),
-        )?;
+        // Persist all rewritten Info.plists, including embedded watchOS apps and their extensions,
+        // before apple-codesign scans and signs the bundle tree.
+        app.bundle.write_info_recursive()?;
 
         if let Some(callback) = &progress_callback {
             callback(0.3).await;
@@ -191,7 +257,8 @@ impl Sideloader {
         sign::sign(
             &mut app,
             &cert_identity,
-            &provisioning_profile,
+            &main_provisioning_profile,
+            &provisioning_profiles,
             &special,
             &team,
             progress_callback,
@@ -225,6 +292,41 @@ impl Sideloader {
             .ensure_device_registered(&team, &device_info.name, &device_info.udid, None)
             .await?;
 
+        // Apple Watch companions are exposed by the iPhone's companion_proxy.
+        // Register each paired Watch through Apple's watchOS developer endpoint
+        // before requesting watchOS provisioning profiles.
+        let mut provisioning_companion_proxy = CompanionProxy::connect(device_provider)
+            .await
+            .context("Failed to connect to Apple Watch companion proxy")?;
+
+        let paired_watches = provisioning_companion_proxy
+            .get_device_registry()
+            .await
+            .context("Failed to list paired Apple Watch devices")?;
+
+        for watch_udid in paired_watches {
+            let watch_name = provisioning_companion_proxy
+                .get_value(&watch_udid, "DeviceName")
+                .await
+                .ok()
+                .and_then(|value| value.as_string().map(str::to_string))
+                .unwrap_or_else(|| "Apple Watch".to_string());
+
+            self.dev_session
+                .ensure_device_registered(
+                    &team,
+                    &watch_name,
+                    &watch_udid,
+                    Some(DeveloperDeviceType::Watchos),
+                )
+                .await
+                .context("Failed to register paired Apple Watch as a development device")?;
+        }
+
+        // companion_proxy can be invalidated while the iPhone app is installed.
+        // Do not reuse this provisioning connection for the post-install Watch transfer.
+        drop(provisioning_companion_proxy);
+
         let (signed_app_path, special_app) = self
             .sign_app(
                 app_path,
@@ -242,6 +344,27 @@ impl Sideloader {
         .await
         .context("Failed to install app on device")?;
 
+        // The iPhone install may leave the embedded Watch app as a process-scoped placeholder.
+        // Re-open the signed bundle before cleanup and install each Watch app directly through
+        // the paired Watch's streaming_zip_conduit service. This is the path physically validated
+        // on watchOS after the signed Watch bundle itself was proven valid.
+        let signed_bundle = Bundle::new(signed_app_path.clone())?;
+        let watch_apps = signed_bundle.watch_apps().to_vec();
+
+        if !watch_apps.is_empty() {
+            info!("Installing Apple Watch companion app directly with fresh companion proxy connections...");
+            crate::sideload::watch_install::install_watch_apps(
+                device_provider,
+                &watch_apps,
+                &self.machine_name,
+                |progress| {
+                    info!("Installing Apple Watch app: {}%", progress);
+                },
+            )
+            .await
+            .context("Failed to install Apple Watch companion app")?;
+        }
+
         if self.delete_app_after_install
             && let Err(e) = isideload_vfs::fs::remove_dir_all(signed_app_path)
         {
@@ -251,7 +374,7 @@ impl Sideloader {
         Ok(special_app)
     }
 
-    /// Get the developer team according to the configured team selection behavior
+    /// Get the developer team according to the configured team selection behavior.
     pub async fn get_team(&mut self) -> Result<DeveloperTeam, Report> {
         if let Some(team) = &self.team {
             return Ok(team.clone());
