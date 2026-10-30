@@ -92,5 +92,15 @@ where
         callback(0.5).await;
     }
 
+    // apple-codesign recursively handles PlugIns/, including Xcode 26's
+    // single-target Watch app. Keep explicit signing only for legacy Watch/
+    // packages, which are outside its automatic nested-bundle traversal.
+    let legacy_watch_dir = app.bundle.bundle_dir.join("Watch");
+    for watch_app in app.bundle.watch_apps() {
+        if watch_app.bundle_dir.starts_with(&legacy_watch_dir) {
+            sign_bundle(&watch_app.bundle_dir, &settings)?;
+        }
+    }
+
     Ok(sign_bundle(&app.bundle.bundle_dir, &settings)?)
 }
